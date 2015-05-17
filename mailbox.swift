@@ -1,9 +1,28 @@
 
 import Foundation
 
+public protocol OutgoingMailboxType {
+    typealias Message
+    func send(message: Message)
+}
+
+public protocol IncomingMailboxType {
+    typealias Message
+    func receive() -> Message
+}
+
+public protocol ClosableMailboxType {
+    typealias Message
+    func close()
+}
+
+public protocol ClosableIncomingMailboxType : ClosableMailboxType {
+    func receive() -> Message?
+}
+
 // Used to connect concurrent threads and communicate values across them.
 // For more info, visit https://gobyexample.com/channels
-public class Mailbox<T> {
+public class Mailbox<T> : IncomingMailboxType, OutgoingMailboxType {
     
     // Signals--communicating mailbox and delivery status between threads
     private let mailboxNotFull: dispatch_queue_t
@@ -28,6 +47,8 @@ public class Mailbox<T> {
     // the capacity is 0, and every sent message is blocking until it is
     // received.`
     public init(capacity: Int = 0) {
+        
+        // Check to make sure that the capacity is non-negative
         assert(capacity >= 0, "Channel capacity must be a positive value")
         self.capacity = capacity
         
@@ -47,6 +68,7 @@ public class Mailbox<T> {
         // over capacity and unblock it once a message has been received so we
         // are again at normal capacity.
         self.messageReceived = dispatch_semaphore_create(capacity)
+
     }
     
     public func send(message: T) {
@@ -100,13 +122,94 @@ public class Mailbox<T> {
         
         return message
     }
+
+}
+
+public class ClosableMailbox<T> : Mailbox<T>, ClosableMailboxType, SequenceType {
+    
+    // Signals when a message is added to the mailbox so we can defer checking
+    // the closed state to the last possible moment.
+    private let mailboxReady = dispatch_semaphore_create(0)
+    
+    // Lock used to keep synchronous the checking and changing of the closed flag
+    private let keepState = dispatch_semaphore_create(1)
+
+    override init(capacity: Int = 0) {
+        super.init(capacity: capacity)
+    }
+    
+    // Tracks whether or not the mailbox has been closed
+    private var isClosed = false
+
+    override public func send(message: T) {
+        // Signals that a message was sent to that we can stop deferring our
+        // empty and closed checks
+        dispatch_semaphore_signal(mailboxReady)
+        
+        super.send(message)
+    }
+    
+    // Receieve optional messages: T? while the mailbox is open
+    // and nil once the mailbox has been closed
+    public func receive() -> T? {
+        
+        // Defers checking the mailbox until last minute (aka until something
+        // has actually been added).
+        dispatch_semaphore_wait(mailboxReady, DISPATCH_TIME_FOREVER)
+        
+        // Claims the mailbox and checks if it is empty
+        dispatch_semaphore_wait(openMailbox, DISPATCH_TIME_FOREVER)
+        let empty = mailbox.isEmpty
+        dispatch_semaphore_signal(openMailbox)
+    
+        // If the mailbox was empty, we should check if it is closed
+        if empty {
+            
+            // Claim mailbox so that we can check if it is closed
+            dispatch_semaphore_wait(keepState, DISPATCH_TIME_FOREVER)
+            let closed = self.isClosed
+            dispatch_semaphore_signal(keepState)
+            
+            // It the mailbox was closed, we ought to return nil from this
+            // function
+            if closed { return nil }
+        }
+        
+        return super.receive()
+    }
+    
+    override public func receive() -> T {
+        fatalError("ClosableMailbox instance must use the optional recieve function")
+    }
+    
+    public func close() {
+        // Claim mailbox so that we can set the closed state
+        dispatch_semaphore_wait(self.keepState, DISPATCH_TIME_FOREVER)
+        self.isClosed = true
+        dispatch_semaphore_signal(self.keepState)
+        
+        dispatch_semaphore_signal(mailboxReady)
+    }
+    
+    public func generate() -> ClosableMailboxGenerator<T> {
+        return ClosableMailboxGenerator<T>(mailbox: self)
+    }
+}
+
+public struct ClosableMailboxGenerator<T> : GeneratorType {
+    
+    private let mailbox: ClosableMailbox<T>
+    public mutating func next() -> T? {
+        return mailbox.receive()
+    }
 }
 
 // Custom operators for sending and recieving mail.
 prefix operator <- { }
 infix operator <- { }
-public prefix func <-<T>(rhs: Mailbox<T>) -> T { return rhs.receive() }
-public func <-<T>(lhs: Mailbox<T>, rhs: T) { return lhs.send(rhs) }
+public prefix func <-<M : IncomingMailboxType>(rhs: M) -> M.Message { return rhs.receive() }
+public prefix func <-<M : ClosableIncomingMailboxType>(rhs: M) -> M.Message? { return rhs.receive() }
+public func <-<M : OutgoingMailboxType>(lhs: M, rhs: M.Message) { return lhs.send(rhs) }
 
 // Calls the passed in function or closure on a background thread. Equivalent
 // to Go's "go" keyword.
@@ -119,3 +222,4 @@ public func dispatch(routine: () -> ()) {
 public func main(routine: () -> ()) {
     dispatch_async(dispatch_get_main_queue(), routine)
 }
+
