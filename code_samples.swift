@@ -1,10 +1,3 @@
-//
-//  main.swift
-//  Go routine
-//
-//  Created by Jaden Geller on 5/17/15.
-//  Copyright (c) 2015 Jaden Geller. All rights reserved.
-//
 
 import Foundation
 
